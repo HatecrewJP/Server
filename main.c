@@ -42,7 +42,45 @@ typedef struct ipv4_header{
 } ipv4_header;
 
 
-static int VerfiyIPv4Checksum(char *Buffer, int BufferSize, int Count){
+typedef struct tcp_header{
+    unsigned short SrcPort;
+    unsigned short DestPort;
+    unsigned int SequenceNumber;
+    unsigned char DataOffset : 4;
+    unsigned char Reserved : 4;
+    union {
+        unsigned char Flags;
+        struct {
+            unsigned char CWR : 1;
+            unsigned char ECE : 1;
+            unsigned char URG : 1;
+            unsigned char ACK : 1;
+            unsigned char PSH : 1;
+            unsigned char RST : 1;
+            unsigned char SYN : 1;
+            unsigned char FIN : 1;
+        };
+    };
+    unsigned short WindowSize;
+    unsigned short Checksum;
+    unsigned short UrgentPointer;
+    char Optional[40];
+}tcp_header;
+
+static tcp_header CopyTCPHeader(unsigned char *Buffer, int BufferSize){
+    tcp_header Result = {};
+    Assert(BufferSize >= 20);
+    
+    
+    Result.SrcPort = (((unsigned short)Buffer[0]) << 8 )| (unsigned short)Buffer[1];
+    Result.DestPort = (((unsigned short)Buffer[2]) << 8) | (unsigned short)Buffer[3];
+    return Result;
+}
+
+
+static int VerfiyIPv4Checksum(unsigned char *Buffer, int BufferSize, int Count){
+    //Algorithm taken from Wikipedia: https://en.wikipedia.org/wiki/Internet_checksum#Algorithm
+    
     Assert(BufferSize > Count);
     int sum = 0;
     unsigned short *Value = (unsigned short*) Buffer;
@@ -177,7 +215,7 @@ int main(){
     memcpy(Data,Buffer + HeaderLengthInBytes,DataSize);
     
     
-    
+    tcp_header TCPHeader = CopyTCPHeader(Data,DataSize); 
     
     
     
