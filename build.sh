@@ -1,0 +1,1 @@
+gcc -ggdb main.c -o Server
