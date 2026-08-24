@@ -465,22 +465,21 @@ int main(){
         return 1;
     }
     
-    /*
-    struct addrinfo *SocketAddressInfo = 0;
-    iResult = getaddrinfo("127.0.0.1",NULL,NULL,(struct addrinfo**) &SocketAddressInfo);
-    */
     struct sockaddr_in SockAddr = {0};
     SockAddr.sin_family = AF_INET;
     SockAddr.sin_addr = (struct in_addr){0x0100007fU};
-    /*
+    
     iResult = bind(RawSockIPv4, (struct sockaddr*)&SockAddr, sizeof(SockAddr));
     if(iResult == -1){
         perror("bind");
         return 1;
-    }*/
+    }
+    int SockProt = 0;
+    int SockLen = sizeof(SockProt);
+    iResult = getsockopt(RawSockIPv4,SOL_SOCKET,SO_PROTOCOL,(char*)&SockProt,&SockLen );
     
-    
-    
+    int Enable = 1;
+    iResult = setsockopt(RawSockIPv4,IPPROTO_IP,IP_HDRINCL,&Enable, sizeof(Enable));
     
     ipv4_header  IPv4Header;
     pseudo_tcp_header PseudoHeader = {0};
@@ -503,6 +502,7 @@ int main(){
             Assert(HeaderLengthInBytes >= 60);
             memcpy(IPv4Header.Optional, Buffer + 20, HeaderLengthInBytes - 20);
         }
+        
         
         
         int Verfied = 0;
@@ -568,7 +568,7 @@ int main(){
         SynAckIPv4Header.Identification = 0x1234;
         SynAckIPv4Header.DF = 1;
         SynAckIPv4Header.TimeToLive = 10;
-        SynAckIPv4Header.Protocol = 5;
+        SynAckIPv4Header.Protocol = 6;
         SynAckIPv4Header.SrcAddress = IPv4Header.DestAddress;
         SynAckIPv4Header.DestAddress = IPv4Header.SrcAddress;
         
@@ -587,7 +587,7 @@ int main(){
         
         int PacketLength = SynAckIPv4Header.TotalLength;
         
-        unsigned char *Packet = malloc(PacketLength);
+        unsigned char *Packet = malloc(PacketLength );
         Assert(Packet);
         int Offset = 0;
         
@@ -596,9 +596,11 @@ int main(){
         
         
         
+        struct sockaddr_in DestAddress = {0};
+        DestAddress.sin_family = AF_INET;
+        DestAddress.sin_addr.s_addr = ByteSwapU32(SynAckIPv4Header.DestAddress);
         
-        
-        iResult = sendto(RawSockIPv4, (char*)Packet, PacketLength,0, NULL,0);
+        iResult = sendto(RawSockIPv4, (char*)Packet, PacketLength,0, (struct sockaddr *)&DestAddress,sizeof(DestAddress));
         if(iResult == -1){
             perror("sendto");
             return 1;
