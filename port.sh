@@ -1,0 +1,1 @@
+sudo iptables -t filter -I OUTPUT -p tcp --sport 27015 --tcp-flags RST RST -j DROP

@@ -21,19 +21,19 @@ typedef struct IPv4Option{
 } IPv4Option;
 
 typedef struct ipv4_header{
-    unsigned char Version : 4;
-    unsigned char InternetHeaderLength : 4;
-    unsigned char DSCP : 6;
     unsigned char ECN : 2;
+    unsigned char DSCP : 6;
+    unsigned char InternetHeaderLength : 4;
+    unsigned char Version : 4;
     unsigned short TotalLength;
     unsigned short Identification;
-    unsigned short R  : 1;
-    unsigned short DF : 1;
-    unsigned short MF : 1;
-    
-    unsigned short FragmentOffset : 13;
-    unsigned char TimeToLive;
+    unsigned char FragmentOffsetL;
+    unsigned char FragmentOffsetH : 5;
+    unsigned char MF : 1;
+    unsigned char DF : 1;
+    unsigned char R  : 1;
     unsigned char Protocol;
+    unsigned char TimeToLive;
     unsigned short Checksum;
     union{
         unsigned int SrcAddress;
@@ -50,6 +50,7 @@ typedef struct ipv4_header{
     };
 } ipv4_header;
 
+
 typedef struct pseudo_tcp_header{
     unsigned int SrcAddress;
     unsigned int DestAddress;
@@ -64,27 +65,37 @@ typedef struct tcp_header{
     unsigned short DestPort;
     unsigned int SequenceNumber;
     unsigned int AckNumber;
-    unsigned char DataOffset : 4;
-    unsigned char Reserved : 3;
-    unsigned char AccurateECN : 1;
+    
     union {
         unsigned char Flags;
         struct {
-            unsigned char CWR : 1;
-            unsigned char ECE : 1;
-            unsigned char URG : 1;
-            unsigned char ACK : 1;
-            unsigned char PSH : 1;
-            unsigned char RST : 1;
-            unsigned char SYN : 1;
             unsigned char FIN : 1;
+            unsigned char SYN : 1;
+            unsigned char RST : 1;
+            unsigned char PSH : 1;
+            unsigned char ACK : 1;
+            unsigned char URG : 1;
+            unsigned char ECE : 1;
+            unsigned char CWR : 1;
         };
     };
+    unsigned char Reserved : 3;
+    unsigned char AccurateECN : 1;
+    unsigned char DataOffset : 4;
     unsigned short WindowSize;
     unsigned short Checksum;
     unsigned short UrgentPointer;
     char Optional[40];
 }tcp_header;
+
+
+typedef struct tcp_packet{
+    ipv4_header Ipv4Header;
+    tcp_header TCPHeader;
+    pseudo_tcp_header PseudoHeader;
+    unsigned char *Data;
+    int DataSize;
+} tcp_packet;
 
 
 static inline unsigned int ByteSwapU32(unsigned int In){
@@ -96,22 +107,26 @@ static inline unsigned short ByteSwapU16(unsigned short In){
     return ((In & 0xff) << 8) | ((In & 0xff00) >> 8);
 }
 
+static inline unsigned short GetFragmentOffset(ipv4_header Header){
+    return ((unsigned short)Header.FragmentOffsetH) << 8 | (unsigned short)Header.FragmentOffsetL;
+}
 
 
 
-static int VerfiyIPv4Checksum(unsigned char *Buffer, int BufferSize, int Count){
+
+static int VerfiyIPv4Checksum(ipv4_header *Header){
     //Algorithm taken from Wikipedia: https://en.wikipedia.org/wiki/Internet_checksum#Algorithm
     
-    Assert(BufferSize >= Count);
     int sum = 0;
-    unsigned short *Value = (unsigned short*) Buffer;
+    unsigned short *Value = (unsigned short*)Header;
+    int Count = Header->InternetHeaderLength * 4;
     while(Count > 1){
         sum += *Value++;
         Count -= 2;
     }
     
     if(Count > 0){
-        sum += (unsigned char)*Buffer;
+        sum += (unsigned char)*Value;
     }
     
     while(sum >> 16) {
@@ -122,99 +137,45 @@ static int VerfiyIPv4Checksum(unsigned char *Buffer, int BufferSize, int Count){
     
 }
 
-static int VerfiyTCPChecksum(unsigned char *TCPSegment, 
-                             int SegmentSize,
-                             pseudo_tcp_header PseudoHeader //already converted to Little Endian
-                             )
-{
-    
-    //Algorithm taken from Wikipedia: https://en.wikipedia.org/wiki/Internet_checksum#Algorithm
-    int sum = 0;
-    unsigned short *Value = (unsigned short*) &PseudoHeader;
-    int i = sizeof(PseudoHeader);
-    Assert(i % 2 == 0);
-    while(i > 0){
-        sum += *Value++;
-        i-=2;
-    }
-    
-    Value = (unsigned short*) TCPSegment;
-    int Count =  SegmentSize;
-    while(Count > 1){
-        //The Segment is still in Big Endian. Convert before adding.
-        sum +=  ByteSwapU16(*Value++);
-        Count -= 2;
-    }
-    
-    if(Count > 0){
-        sum += (unsigned char)*TCPSegment;
-    }
-    
-    while(sum >> 16) {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum = ~sum;
-    return (sum & 0xffff) == 0;
-    
-}
-
-
-static int VerfiyIPv4Checksum2(unsigned char *Buffer, int BufferSize, int Count){
-    //Algorithm taken from Wikipedia: https://en.wikipedia.org/wiki/Internet_checksum#Algorithm
-    
-    Assert(BufferSize >= Count);
-    int sum = 0;
-    unsigned short *Value = (unsigned short*) Buffer;
-    while(Count > 1){
-        sum += *Value++;
-        Count -= 2;
-    }
-    
-    if(Count > 0){
-        sum += (unsigned char)*Buffer;
-    }
-    
-    while(sum >> 16) {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    
-    return (~sum & 0xffff) == 0;
-    
-}
-
-static int VerfiyTCPChecksum2(unsigned char *TCPSegment, 
-                              int SegmentSize,
-                              pseudo_tcp_header PseudoHeader //already converted to Little Endian
+static int VerfiyTCPChecksum(tcp_header *Header,
+                              pseudo_tcp_header *PseudoHeader //already converted to Little Endian
                               )
 {
     
     //Algorithm taken from Wikipedia: https://en.wikipedia.org/wiki/Internet_checksum#Algorithm
     int sum = 0;
-    unsigned short *Value = (unsigned short*) &PseudoHeader;
-    int i = sizeof(PseudoHeader);
+    unsigned short *Value = (unsigned short*) PseudoHeader;
+    int i = sizeof(*PseudoHeader);
     Assert(i % 2 == 0);
     while(i > 0){
         sum += *Value++;
         i-=2;
     }
     
-    Value = (unsigned short*) TCPSegment;
-    int Count =  SegmentSize;
-    while(Count > 1){
-        //The Segment is still in Big Endian. Convert before adding.
+    unsigned short PseudoHeaderChecksum = sum;
+    Value = (unsigned short*) Header;
+    int Count = 20;
+    while(Count > 0){
+        
         sum +=  (*Value++);
         Count -= 2;
     }
-    
+    Count = Header->DataOffset * 4;
+    while(Count > 1){
+
+        sum += ByteSwapU16(*Value++);
+        Count -= 2;
+    }
     if(Count > 0){
-        sum += (unsigned char)*TCPSegment;
+        sum += (unsigned char)*Value;
     }
     
     while(sum >> 16) {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     sum = ~sum;
-    return (sum & 0xffff) == 0;
+    // Checksum Offloading may only calculate the checksum over the Pseudo Header
+    return (sum & 0xffff) == 0 || (PseudoHeaderChecksum == Header->Checksum);
     
 }
 
@@ -245,8 +206,16 @@ static tcp_header CopyTCPHeader(unsigned char *Buffer, int BufferSize){
     Result.SYN = Buffer[13] >> 1 & 0x1;
     Result.FIN = Buffer[13] >> 0 & 0x1;
     Result.WindowSize = Buffer[14] | Buffer[15];
-    Result.Checksum = Buffer[16] | Buffer[17];
+    Result.Checksum = (unsigned short)Buffer[16] << 8 | (unsigned short)Buffer[17];
     Result.UrgentPointer = Buffer[18] | Buffer [19];
+    
+    int OptionsSize = Result.DataOffset * 4 - 20;
+    if(OptionsSize > 0){
+        for(int i = 0; i < OptionsSize; i += 2){
+            Result.Optional[i / 2] = *(unsigned short *)(Buffer + 20 + i);
+        }
+    }
+
     return Result;
 }
 
@@ -264,8 +233,8 @@ static ipv4_header CopyIPv4Header(unsigned char *Buffer, int BufferSize){
     Result.R  = (Buffer[6] >> 5)& 0x1;
     Result.DF = (Buffer[6] >> 6)& 0x1;
     Result.MF = (Buffer[6] >> 7)& 0x1;
-    Result.FragmentOffset = (((unsigned short)Buffer[7]) << 5 )
-        | ((unsigned short)Buffer[6] & 0x1f);
+    Result.FragmentOffsetH = ((unsigned char)Buffer[6] & 0x1f);
+    Result.FragmentOffsetL = (unsigned char)Buffer[7];
     Result.TimeToLive = Buffer[8];
     Result.Protocol = Buffer[9];
     Result.Checksum = ((unsigned short) Buffer[10]) << 8 | ((unsigned short)Buffer[11]);
@@ -285,10 +254,7 @@ static ipv4_header CopyIPv4Header(unsigned char *Buffer, int BufferSize){
     
 };
 
-static unsigned short ComputeTCPIPv4Checksum(ipv4_header IPv4Header, 
-                                             tcp_header TCPHeader, 
-                                             char *TCPData, 
-                                             int TCPDataSize)
+static unsigned short ComputeTCPIPv4Checksum(ipv4_header IPv4Header)
 {
     
     Assert(IPv4Header.Checksum == 0);
@@ -300,19 +266,7 @@ static unsigned short ComputeTCPIPv4Checksum(ipv4_header IPv4Header,
         Sum += *Value++;
         Count-=2;
     }
-    Value = (unsigned short*)&TCPHeader;
-    Count = TCPHeader.DataOffset * 4;
-    Assert(Count % 2 == 0);
-    while(Count > 0){
-        Sum += *Value++;
-        Count-=2;
-    }
-    Value = (unsigned short*)TCPData;
-    Count = TCPDataSize;
-    while(Count > 1){
-        Sum += *Value++;
-        Count-=2;
-    }
+    
     if(Count > 0){
         Sum+=*(unsigned char*)Value++;
     }
@@ -375,8 +329,8 @@ static int IPv4HeaderToNetBuffer(ipv4_header Header,unsigned char *Buffer, int B
     Buffer[6] = (unsigned char)Header.R  << 5;
     Buffer[6] |= (unsigned char)Header.DF << 6;
     Buffer[6] |= (unsigned char)Header.MF << 7;
-    Buffer[6] |= (unsigned char)(Header.FragmentOffset & 0x1f);
-    Buffer[7] = (unsigned char)((Header.FragmentOffset) >> 5);
+    Buffer[6] |= (unsigned char)(Header.FragmentOffsetH & 0x1f);
+    Buffer[7] = (unsigned char)(Header.FragmentOffsetL);
     Buffer[8] = Header.TimeToLive;
     Buffer[9] = Header.Protocol;
     Buffer[10] = (unsigned char)(Header.Checksum >> 8);
@@ -418,7 +372,7 @@ static int TCPHeaderToNetBuffer(tcp_header Header, unsigned char* Buffer, int Bu
     Buffer[9] = (unsigned char)((Header.AckNumber >> 16) & 0xff);
     Buffer[10] = (unsigned char)((Header.AckNumber >> 8) & 0xff);
     Buffer[11] = (unsigned char)((Header.AckNumber >> 0) & 0xff);
-    Buffer[12] = Header.DataOffset << 4| Header.Reserved << 1| Header.AccurateECN;
+    Buffer[12] = Header.DataOffset << 4 | Header.Reserved << 1 | Header.AccurateECN;
     Buffer[13] = Header.CWR << 7;
     Buffer[13] |= Header.ECE << 6;
     Buffer[13] |= Header.URG << 5;
@@ -438,29 +392,50 @@ static int TCPHeaderToNetBuffer(tcp_header Header, unsigned char* Buffer, int Bu
 }
 
 
-
-/*
-int TCPHeaderLength = TCPHeader.DataOffset * 4;
-    int TCPDataLength = PseudoHeader.TCPLength - TCPHeaderLength;
-    
-char *TCPData = 0;
-    if(TCPDataLength > 0){
-        malloc(TCPDataLength);
-        Assert(TCPData);
-        memcpy(TCPData,TCPSegment + TCPHeaderLength, TCPDataLength);
+static tcp_packet ProcessTCPIPPacket(unsigned char* Buffer, int BufferSize){
+    tcp_packet Result = {0};
+    Result.Ipv4Header = CopyIPv4Header(Buffer, BufferSize);
+    Assert(Result.Ipv4Header.Version == 4);
+    Assert(Result.Ipv4Header.Protocol == 6);
+    int TCPHeaderOffset = Result.Ipv4Header.InternetHeaderLength * 4;
+    Result.TCPHeader = CopyTCPHeader(Buffer + TCPHeaderOffset, BufferSize - TCPHeaderOffset);
+    int TCPDataOffset = TCPHeaderOffset + Result.TCPHeader.DataOffset * 4;
+    int TCPDataSize = Result.Ipv4Header.TotalLength - TCPDataOffset;
+    if(TCPDataSize > 0){
+        Result.Data = malloc(TCPDataSize);
+        Assert(Result.Data);
+        memcpy(Result.Data, Buffer + TCPDataOffset, TCPDataSize);
+        Result.DataSize = TCPDataSize;
     }
-    */
+    Result.PseudoHeader.DestAddress = Result.Ipv4Header.DestAddress;
+    Result.PseudoHeader.SrcAddress = Result.Ipv4Header.SrcAddress;
+    Result.PseudoHeader.Protocol = 6;
+    Result.PseudoHeader.TCPLength = Result.Ipv4Header.TotalLength - TCPHeaderOffset;
+    return Result;
 
+}
+
+#include "errno.h"
 int main(){
     
     
     
     int iResult;
+    struct tcp_header Test = {0};
+    Test.ACK = 1;
+    Test.SYN = 1;
+    Test.DataOffset = 5;
     
+
     int RawSockIPv4 = -1;
-    RawSockIPv4= socket(AF_INET,SOCK_RAW,IPPROTO_TCP);
+    RawSockIPv4 = socket(AF_INET,SOCK_RAW,IPPROTO_TCP);
+    int TestSocket = socket(AF_INET,SOCK_RAW,IPPROTO_TCP);
     
     if (RawSockIPv4 == -1) {
+        
+        char * Error = strerror(errno);
+        printf("Error: %s\n",Error);
+        
         perror("socket");
         return 1;
     }
@@ -481,79 +456,37 @@ int main(){
     int Enable = 1;
     iResult = setsockopt(RawSockIPv4,IPPROTO_IP,IP_HDRINCL,&Enable, sizeof(Enable));
     
-    ipv4_header  IPv4Header;
-    pseudo_tcp_header PseudoHeader = {0};
-    tcp_header TCPHeader = {0};
-    unsigned char *TCPSegment;
+ 
     unsigned char Buffer[512] = {0};
-    
+    tcp_packet TCPPacket = {0};
     while(1){
-        iResult = recvfrom(RawSockIPv4, (char*)Buffer, 512, 0,NULL, NULL);
+        iResult = recv(RawSockIPv4, (char*)Buffer, 512, 0);
         if(iResult == -1){
             perror("recvfrom");
             return 1;
         }
         
-        IPv4Header = CopyIPv4Header(Buffer, sizeof(Buffer));
-        Assert(IPv4Header.Version==4);
-        //Length is in 32bit/4bytes => IHL * 4 is length in bytes
-        unsigned int HeaderLengthInBytes = (IPv4Header.InternetHeaderLength << 2); 
-        if( HeaderLengthInBytes > 20){
-            Assert(HeaderLengthInBytes >= 60);
-            memcpy(IPv4Header.Optional, Buffer + 20, HeaderLengthInBytes - 20);
-        }
-        
-        
-        
-        int Verfied = 0;
-        
-        if(IPv4Header.Protocol == 0x6){
-            Verfied = VerfiyIPv4Checksum(Buffer,512, IPv4Header.InternetHeaderLength << 2);
-        }
-        printf("Verficiation: %s\n",Verfied ? "Success" : "Failed");
-        
-        
-        memset(&PseudoHeader,0,sizeof(PseudoHeader));
-        PseudoHeader.SrcAddress = (IPv4Header.SrcAddress);
-        PseudoHeader.DestAddress =(IPv4Header.DestAddress);
-        PseudoHeader.Protocol = IPv4Header.Protocol;
-        PseudoHeader.TCPLength = (unsigned short)(IPv4Header.TotalLength - HeaderLengthInBytes);
-        
-        
-        int DataSize = PseudoHeader.TCPLength;
-        TCPSegment = malloc(DataSize);
-        Assert(TCPSegment);
-        memcpy(TCPSegment,Buffer + HeaderLengthInBytes,DataSize);
-        
-        memset(&TCPHeader,0,sizeof(TCPHeader));
-        TCPHeader = CopyTCPHeader(TCPSegment,DataSize); 
-        if(TCPHeader.DestPort == 27015){
+        TCPPacket = ProcessTCPIPPacket(Buffer, 512);
+        int ValidIPv4 = VerfiyIPv4Checksum(&TCPPacket.Ipv4Header);
+        int ValidTCP = VerfiyTCPChecksum(&TCPPacket.TCPHeader, &TCPPacket.PseudoHeader);
+        if(TCPPacket.TCPHeader.DestPort == 27015 && ValidIPv4 && ValidTCP){
             break;
         }
-        free(TCPSegment);
-        TCPSegment= 0;
+        free(TCPPacket.Data);
         
         
     }
-    
-    printf("Total Length: %u\n", IPv4Header.TotalLength);
-    printf("Source Address: %hhd.%hhd.%hhd.%hhd\n", IPv4Header.SrcIP[3],IPv4Header.SrcIP[2],IPv4Header.SrcIP[1],IPv4Header.SrcIP[0]);
-    printf("Destination Address: %hhd.%hhd.%hhd.%hhd\n", IPv4Header.DestIP[3],IPv4Header.DestIP[2],IPv4Header.DestIP[1],IPv4Header.DestIP[0]);
-    
-    int tcp_verfied = VerfiyTCPChecksum(TCPSegment, PseudoHeader.TCPLength, PseudoHeader);
-    if(tcp_verfied){
-        printf("Src Port: %hu\n", TCPHeader.SrcPort);
-        printf("Dest Port: %hu\n", TCPHeader.DestPort);
-    }
-    if(TCPHeader.SYN){
+   
+ 
+    if(TCPPacket.TCPHeader.SYN){
         
         
         tcp_header SynAckTCPHeader = {};
-        SynAckTCPHeader.SrcPort = TCPHeader.DestPort;
-        SynAckTCPHeader.DestPort = TCPHeader.SrcPort;
+        SynAckTCPHeader.SrcPort = TCPPacket.TCPHeader.DestPort;
+        SynAckTCPHeader.DestPort = TCPPacket.TCPHeader.SrcPort;
         
         SynAckTCPHeader.SequenceNumber = 1234;
-        SynAckTCPHeader.AckNumber = TCPHeader.SequenceNumber + 1;
+        SynAckTCPHeader.AckNumber = TCPPacket.TCPHeader.SequenceNumber + 1;
         SynAckTCPHeader.DataOffset = 5;
         SynAckTCPHeader.ACK = 1;
         SynAckTCPHeader.SYN = 1;
@@ -567,10 +500,10 @@ int main(){
             + SynAckTCPHeader.DataOffset * 4; 
         SynAckIPv4Header.Identification = 0x1234;
         SynAckIPv4Header.DF = 1;
-        SynAckIPv4Header.TimeToLive = 10;
+        SynAckIPv4Header.TimeToLive = 64;
         SynAckIPv4Header.Protocol = 6;
-        SynAckIPv4Header.SrcAddress = IPv4Header.DestAddress;
-        SynAckIPv4Header.DestAddress = IPv4Header.SrcAddress;
+        SynAckIPv4Header.SrcAddress = TCPPacket.Ipv4Header.DestAddress;
+        SynAckIPv4Header.DestAddress = TCPPacket.Ipv4Header.SrcAddress;
         
         
         pseudo_tcp_header SynAckPseudoHeader = {};
@@ -583,7 +516,7 @@ int main(){
         
         
         SynAckTCPHeader.Checksum = ComputeTCPChecksum(SynAckPseudoHeader,SynAckTCPHeader,NULL,0);
-        SynAckIPv4Header.Checksum = ComputeTCPIPv4Checksum(SynAckIPv4Header,SynAckTCPHeader,NULL,0);
+        SynAckIPv4Header.Checksum = ComputeTCPIPv4Checksum(SynAckIPv4Header);
         
         int PacketLength = SynAckIPv4Header.TotalLength;
         
@@ -600,12 +533,43 @@ int main(){
         DestAddress.sin_family = AF_INET;
         DestAddress.sin_addr.s_addr = ByteSwapU32(SynAckIPv4Header.DestAddress);
         
+        printf("ipv4: %hx\ntcp: %hx\n",SynAckIPv4Header.Checksum,SynAckTCPHeader.Checksum);
+        
         iResult = sendto(RawSockIPv4, (char*)Packet, PacketLength,0, (struct sockaddr *)&DestAddress,sizeof(DestAddress));
+        
+        
         if(iResult == -1){
             perror("sendto");
             return 1;
         }
+        memset(Buffer, 0, 512);
+        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
+        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
+        if(iResult == -1){
+            perror("recvfrom");
+            return 1;
+        }
+        tcp_packet ACKPacket = ProcessTCPIPPacket(Buffer, 512);
+        int ValidIPv4Ack = VerfiyIPv4Checksum(&ACKPacket.Ipv4Header);
+        int ValidTCPAck = VerfiyTCPChecksum(&ACKPacket.TCPHeader, &ACKPacket.PseudoHeader);
+        Assert(ValidIPv4Ack && ValidTCPAck);
+        Assert(ACKPacket.TCPHeader.ACK == 1);
+        free(ACKPacket.Data);
         
+        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
+        if(iResult == -1){
+            perror("recvfrom");
+            return 1;
+        }
+        tcp_packet GETPacket = ProcessTCPIPPacket(Buffer, 512);
+        int ValidIPv4Get = VerfiyIPv4Checksum(&GETPacket.Ipv4Header);
+        int ValidTCPGet = VerfiyTCPChecksum(&GETPacket.TCPHeader, &GETPacket.PseudoHeader);
+        Assert(ValidIPv4Get &&ValidTCPGet);
+        Assert(GETPacket.DataSize > 0);
+        printf("Data: %s\n", GETPacket.Data);
+
+
+
         
         
         
