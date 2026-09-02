@@ -12,7 +12,8 @@
 
 #define DEFAULT_ADDRESS 0x7f000002U
 
-#define DEFAULT_PORT "27015"
+#define DEFAULT_PORT 27015U
+#define DEFAULT_PORT_STR "27015"
 
 typedef struct IPv4Option{
     unsigned char OptionNumber : 5;
@@ -419,16 +420,241 @@ static tcp_packet ProcessTCPIPPacket(unsigned char* Buffer, int BufferSize){
 }
 
 #include "errno.h"
+typedef enum tcp_state{
+    LISTEN,
+    SYN_SENT,
+    ESTABLISHED,
+    FIN_WAIT1,
+    FIN_WAIT2,
+    TIME_WAIT,
+    CLOSE_WAIT,
+    CLOSED,
+
+    TCP_STATE_COUNT
+}tcp_state;
+
+static int HandshakeSYN(int sock, tcp_packet *TCPPacket, unsigned int *SeqNumber, unsigned int *Identification){
+    tcp_header SynAckTCPHeader = {};
+    SynAckTCPHeader.SrcPort = DEFAULT_PORT;
+    SynAckTCPHeader.DestPort = TCPPacket->TCPHeader.SrcPort;
+
+    SynAckTCPHeader.SequenceNumber = *SeqNumber;
+    (*SeqNumber)++;
+    SynAckTCPHeader.AckNumber = TCPPacket->TCPHeader.SequenceNumber + 1;
+    SynAckTCPHeader.DataOffset = 5;
+    SynAckTCPHeader.ACK = 1;
+    SynAckTCPHeader.SYN = 1;
+    SynAckTCPHeader.WindowSize = 512;
+
+
+    ipv4_header SynAckIPv4Header = {};
+    SynAckIPv4Header.Version = 4;
+    SynAckIPv4Header.InternetHeaderLength = 5;
+    SynAckIPv4Header.TotalLength = SynAckIPv4Header.InternetHeaderLength * 4
+        + SynAckTCPHeader.DataOffset * 4;
+    SynAckIPv4Header.Identification = (*Identification)++;
+    SynAckIPv4Header.DF = 1;
+    SynAckIPv4Header.TimeToLive = 64;
+    SynAckIPv4Header.Protocol = 6;
+    SynAckIPv4Header.SrcAddress = TCPPacket->Ipv4Header.DestAddress;
+    SynAckIPv4Header.DestAddress = TCPPacket->Ipv4Header.SrcAddress;
+
+
+    pseudo_tcp_header SynAckPseudoHeader = {};
+    SynAckPseudoHeader.SrcAddress = SynAckIPv4Header.SrcAddress;
+    SynAckPseudoHeader.DestAddress = SynAckIPv4Header.DestAddress;
+    SynAckPseudoHeader.Protocol = SynAckIPv4Header.Protocol;
+    SynAckPseudoHeader.TCPLength = SynAckTCPHeader.DataOffset * 4;
+    SynAckTCPHeader.Checksum = ComputeTCPChecksum(&SynAckPseudoHeader, &SynAckTCPHeader, NULL, 0);
+    SynAckIPv4Header.Checksum = ComputeTCPIPv4Checksum(SynAckIPv4Header);
+
+    int PacketLength = SynAckIPv4Header.TotalLength;
+    unsigned char *Packet = malloc(PacketLength);
+    Assert(Packet);
+    int Offset = 0;
+    Offset += IPv4HeaderToNetBuffer(SynAckIPv4Header, Packet, 512);
+    Offset += TCPHeaderToNetBuffer(SynAckTCPHeader, Packet + Offset, 512);
+    struct sockaddr_in DestAddress = {0};
+    DestAddress.sin_family = AF_INET;
+    DestAddress.sin_addr.s_addr = ByteSwapU32(SynAckIPv4Header.DestAddress);
+    int iResult = sendto(sock, (char *)Packet, PacketLength, 0, (struct sockaddr *)&DestAddress, sizeof(DestAddress));
+    free(Packet);
+    if(iResult == -1){
+        perror("sendto");
+        return 0;
+    }
+    return 1;
+}
+
+static int HTTPHello(int sock, tcp_packet *TCPPacket, unsigned int *SeqNumber, unsigned int *Identification){
+    char Payload[] = "HTTP/1.1 200 OK\r\n"
+        //"Connection: close\r\n"
+        "Content-Length: 18\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "Hello from Server!";
+    int PayloadSize = sizeof(Payload) - 1;
+
+    tcp_packet HTTPResponse = {0};
+    HTTPResponse.Data = Payload;
+    HTTPResponse.DataSize = PayloadSize;
+
+    HTTPResponse.Ipv4Header.Version = 4;
+    HTTPResponse.Ipv4Header.InternetHeaderLength = 5;
+    HTTPResponse.Ipv4Header.Identification = (*Identification)++;
+    HTTPResponse.Ipv4Header.DF = 1;
+    HTTPResponse.Ipv4Header.TimeToLive = 64;
+    HTTPResponse.Ipv4Header.Protocol = 6;
+    HTTPResponse.Ipv4Header.SrcAddress = DEFAULT_ADDRESS;
+    HTTPResponse.Ipv4Header.DestAddress = TCPPacket->Ipv4Header.SrcAddress;
+
+    HTTPResponse.TCPHeader.SrcPort = DEFAULT_PORT;
+    HTTPResponse.TCPHeader.DestPort = TCPPacket->TCPHeader.SrcPort;
+    HTTPResponse.TCPHeader.AckNumber = TCPPacket->TCPHeader.SequenceNumber + 1;
+    HTTPResponse.TCPHeader.SequenceNumber = *SeqNumber;
+    HTTPResponse.TCPHeader.DataOffset = 5;
+    HTTPResponse.TCPHeader.ACK = 1;
+    HTTPResponse.TCPHeader.WindowSize = 512;
+    *SeqNumber += HTTPResponse.DataSize;
+
+    HTTPResponse.PseudoHeader.SrcAddress = TCPPacket->Ipv4Header.SrcAddress;
+    HTTPResponse.PseudoHeader.DestAddress = TCPPacket->Ipv4Header.DestAddress;
+    HTTPResponse.PseudoHeader.Protocol = 6;
+    HTTPResponse.PseudoHeader.TCPLength = HTTPResponse.TCPHeader.DataOffset * 4 + HTTPResponse.DataSize;
+
+    HTTPResponse.Ipv4Header.TotalLength = HTTPResponse.Ipv4Header.InternetHeaderLength * 4 + HTTPResponse.PseudoHeader.TCPLength;
+
+    HTTPResponse.TCPHeader.Checksum = ComputeTCPChecksum(&HTTPResponse.PseudoHeader, &HTTPResponse.TCPHeader, HTTPResponse.Data, HTTPResponse.DataSize);
+    HTTPResponse.Ipv4Header.Checksum = ComputeTCPIPv4Checksum(HTTPResponse.Ipv4Header);
+
+    int PacketLength = HTTPResponse.Ipv4Header.TotalLength;
+    unsigned char *Packet = malloc(PacketLength);
+    Assert(Packet);
+
+    int Offset = 0;
+    Offset += IPv4HeaderToNetBuffer(HTTPResponse.Ipv4Header, Packet, 512);
+    Offset += TCPHeaderToNetBuffer(HTTPResponse.TCPHeader, Packet + Offset, 512);
+    memcpy(Packet + Offset, HTTPResponse.Data, HTTPResponse.DataSize);
+
+    struct sockaddr_in DestAddress = {0};
+    DestAddress.sin_family = AF_INET;
+    DestAddress.sin_addr.s_addr = ByteSwapU32(HTTPResponse.Ipv4Header.DestAddress);
+
+    int iResult = sendto(sock, (char *)Packet, PacketLength, 0, (struct sockaddr *)&DestAddress, sizeof(DestAddress));
+    free(Packet);
+    if(iResult == -1){
+        perror("sendto");
+        return 0;
+    }
+    return 1;
+}
+static int TerminateACK(int sock, tcp_packet *TCPPacket, unsigned int *SeqNumber, unsigned int *Identification){
+    tcp_packet ACKClosePacket = {0};
+
+    ACKClosePacket.Ipv4Header.Version = 4;
+    ACKClosePacket.Ipv4Header.InternetHeaderLength = 5;
+    ACKClosePacket.Ipv4Header.Identification = (*Identification)++;
+    ACKClosePacket.Ipv4Header.DF = 1;
+    ACKClosePacket.Ipv4Header.TimeToLive = 64;
+    ACKClosePacket.Ipv4Header.Protocol = 6;
+    ACKClosePacket.Ipv4Header.SrcAddress = DEFAULT_ADDRESS;
+    ACKClosePacket.Ipv4Header.DestAddress = TCPPacket->Ipv4Header.SrcAddress;
+
+    ACKClosePacket.TCPHeader.SrcPort = DEFAULT_PORT;
+    ACKClosePacket.TCPHeader.DestPort = TCPPacket->TCPHeader.SrcPort;
+    ACKClosePacket.TCPHeader.AckNumber = TCPPacket->TCPHeader.SequenceNumber + 1;
+    ACKClosePacket.TCPHeader.SequenceNumber = *SeqNumber;
+    ACKClosePacket.TCPHeader.DataOffset = 5;
+    ACKClosePacket.TCPHeader.ACK = 1;
+    ACKClosePacket.TCPHeader.WindowSize = 512;
+    *SeqNumber += ACKClosePacket.DataSize;
+
+    ACKClosePacket.PseudoHeader.SrcAddress = ACKClosePacket.Ipv4Header.SrcAddress;
+    ACKClosePacket.PseudoHeader.DestAddress = ACKClosePacket.Ipv4Header.DestAddress;
+    ACKClosePacket.PseudoHeader.Protocol = 6;
+    ACKClosePacket.PseudoHeader.TCPLength = ACKClosePacket.TCPHeader.DataOffset * 4 + ACKClosePacket.DataSize;
+
+    ACKClosePacket.Ipv4Header.TotalLength = ACKClosePacket.Ipv4Header.InternetHeaderLength * 4 + ACKClosePacket.PseudoHeader.TCPLength;
+
+    ACKClosePacket.TCPHeader.Checksum = ComputeTCPChecksum(&ACKClosePacket.PseudoHeader, &ACKClosePacket.TCPHeader, ACKClosePacket.Data, ACKClosePacket.DataSize);
+    ACKClosePacket.Ipv4Header.Checksum = ComputeTCPIPv4Checksum(ACKClosePacket.Ipv4Header);
+
+    int PacketLength = ACKClosePacket.Ipv4Header.TotalLength;
+    unsigned char *Packet = malloc(PacketLength);
+    Assert(Packet);
+
+    int Offset = 0;
+    Offset += IPv4HeaderToNetBuffer(ACKClosePacket.Ipv4Header, Packet, 512);
+    Offset += TCPHeaderToNetBuffer(ACKClosePacket.TCPHeader, Packet + Offset, 512);
+    memcpy(Packet + Offset, ACKClosePacket.Data, ACKClosePacket.DataSize);
+    struct sockaddr_in DestAddress = {0};
+    DestAddress.sin_family = AF_INET;
+    DestAddress.sin_addr.s_addr = ByteSwapU32(ACKClosePacket.Ipv4Header.DestAddress);
+
+    int iResult = sendto(sock, (char *)Packet, PacketLength, 0, (struct sockaddr *)&DestAddress, sizeof(DestAddress));
+    free(Packet);
+    if(iResult == -1){
+        perror("sendto");
+        return 0;
+    }
+
+    return 1;
+}
+
+static int RejectMessage(int sock, tcp_packet *TCPPacket){
+    tcp_header RSTTCPHeader = {};
+    RSTTCPHeader.SrcPort = DEFAULT_PORT;
+    RSTTCPHeader.DestPort = TCPPacket->TCPHeader.SrcPort;
+
+    RSTTCPHeader.SequenceNumber = 0;
+    RSTTCPHeader.AckNumber = 0;
+    RSTTCPHeader.DataOffset = 5;
+    RSTTCPHeader.ACK = 1;
+    RSTTCPHeader.RST = 1;
+    RSTTCPHeader.WindowSize = 512;
+
+
+    ipv4_header RSTIPv4Header = {};
+    RSTIPv4Header.Version = 4;
+    RSTIPv4Header.InternetHeaderLength = 5;
+    RSTIPv4Header.TotalLength = RSTIPv4Header.InternetHeaderLength * 4
+        + RSTTCPHeader.DataOffset * 4;
+    RSTIPv4Header.Identification = 0;
+    RSTIPv4Header.DF = 1;
+    RSTIPv4Header.TimeToLive = 64;
+    RSTIPv4Header.Protocol = 6;
+    RSTIPv4Header.SrcAddress = TCPPacket->Ipv4Header.DestAddress;
+    RSTIPv4Header.DestAddress = TCPPacket->Ipv4Header.SrcAddress;
+
+
+    pseudo_tcp_header SynAckPseudoHeader = {};
+    SynAckPseudoHeader.SrcAddress = RSTIPv4Header.SrcAddress;
+    SynAckPseudoHeader.DestAddress = RSTIPv4Header.DestAddress;
+    SynAckPseudoHeader.Protocol = RSTIPv4Header.Protocol;
+    SynAckPseudoHeader.TCPLength = RSTTCPHeader.DataOffset * 4;
+    RSTTCPHeader.Checksum = ComputeTCPChecksum(&SynAckPseudoHeader, &RSTTCPHeader, NULL, 0);
+    RSTIPv4Header.Checksum = ComputeTCPIPv4Checksum(RSTIPv4Header);
+
+    int PacketLength = RSTIPv4Header.TotalLength;
+    unsigned char *Packet = malloc(PacketLength);
+    Assert(Packet);
+    int Offset = 0;
+    Offset += IPv4HeaderToNetBuffer(RSTIPv4Header, Packet, 512);
+    Offset += TCPHeaderToNetBuffer(RSTTCPHeader, Packet + Offset, 512);
+    struct sockaddr_in DestAddress = {0};
+    DestAddress.sin_family = AF_INET;
+    DestAddress.sin_addr.s_addr = ByteSwapU32(RSTIPv4Header.DestAddress);
+    int iResult = sendto(sock, (char *)Packet, PacketLength, 0, (struct sockaddr *)&DestAddress, sizeof(DestAddress));
+    free(Packet);
+    if(iResult == -1){
+        perror("sendto");
+        return 0;
+    }
+    return 1;
+}
+
 int main(){
-    
-    
-    
     int iResult;
-    struct tcp_header Test = {0};
-    Test.ACK = 1;
-    Test.SYN = 1;
-    Test.DataOffset = 5;
-    
 
     int RawSockIPv4 = -1;
     RawSockIPv4 = socket(AF_INET,SOCK_RAW,IPPROTO_TCP);
@@ -462,6 +688,12 @@ int main(){
  
     unsigned char Buffer[512] = {0};
     tcp_packet TCPPacket = {0};
+
+    int State = LISTEN;
+    unsigned int ConnectionAddress = 0;
+    unsigned int ConnectionPort = 0;
+    int SeqNumber = 0;
+    int Identification = 0x1234;
     while(1){
         iResult = recv(RawSockIPv4, (char*)Buffer, 512, 0);
         if(iResult == -1){
@@ -470,252 +702,71 @@ int main(){
         }
         
         TCPPacket = ProcessTCPIPPacket(Buffer, 512);
+        Assert(TCPPacket.Ipv4Header.Protocol = 6);
+
         int ValidIPv4 = VerfiyIPv4Checksum(&TCPPacket.Ipv4Header);
         int ValidTCP = VerfiyTCPChecksum(&TCPPacket.TCPHeader, &TCPPacket.PseudoHeader);
-        if(TCPPacket.TCPHeader.DestPort == 27015 && ValidIPv4 && ValidTCP){
-            break;
+        if(TCPPacket.TCPHeader.DestPort != DEFAULT_PORT | !ValidIPv4 | !ValidTCP){
+            free(TCPPacket.Data);
+            continue;
         }
-        free(TCPPacket.Data);
-        
-        
+        switch(State){
+            case LISTEN:{
+                Assert(ConnectionAddress == 0 && ConnectionPort == 0);
+                if(TCPPacket.TCPHeader.SYN){
+                    ConnectionAddress = TCPPacket.Ipv4Header.SrcAddress;
+                    ConnectionPort = TCPPacket.TCPHeader.SrcPort;
+                    
+                    HandshakeSYN(RawSockIPv4, &TCPPacket, &SeqNumber, &Identification);
+                    State = SYN_SENT;
+                }
+
+            }break;
+            case SYN_SENT:{
+                if(TCPPacket.TCPHeader.SrcPort == ConnectionPort){
+                    if(TCPPacket.Ipv4Header.SrcAddress == ConnectionAddress){
+                        if(TCPPacket.TCPHeader.ACK = 1){
+                            State = ESTABLISHED;
+                        }
+                    }
+                    else{
+                        RejectMessage(RawSockIPv4, &TCPPacket);
+                    }
+                }
+            }break;
+            case ESTABLISHED:{
+                if(TCPPacket.TCPHeader.SrcPort == ConnectionPort){
+                    if(TCPPacket.Ipv4Header.SrcAddress == ConnectionAddress){
+                        if(TCPPacket.TCPHeader.FIN == 1 && TCPPacket.TCPHeader.ACK == 1){
+                            TerminateACK(RawSockIPv4, &TCPPacket, &SeqNumber, &Identification);
+                            printf("Connection Closed\n");
+                            ConnectionAddress = 0;
+                            ConnectionPort = 0;
+                            State = LISTEN;
+                        } 
+                        else if(TCPPacket.TCPHeader.RST == 1){
+                            ConnectionAddress = 0;
+                            ConnectionPort = 0;
+                            State = LISTEN;
+                        }
+                        else{
+                            if(TCPPacket.DataSize > 0){
+                                printf("Data: %s\n", TCPPacket.Data);
+                                HTTPHello(RawSockIPv4,&TCPPacket, &SeqNumber, &Identification);
+                            }
+                        }
+                    }
+                }
+                else{
+                    RejectMessage(RawSockIPv4, &TCPPacket);
+                }
+            }break;
+            
+
+        }
     }
    
- 
-    if(TCPPacket.TCPHeader.SYN){
-        
-        int SeqNumber = 0;
-        int Identification = 0x1234;
-
-        tcp_header SynAckTCPHeader = {};
-        SynAckTCPHeader.SrcPort = 27015;
-        SynAckTCPHeader.DestPort = TCPPacket.TCPHeader.SrcPort;
-        
-        SynAckTCPHeader.SequenceNumber = SeqNumber;
-        SeqNumber++;
-        SynAckTCPHeader.AckNumber = TCPPacket.TCPHeader.SequenceNumber + 1;
-        SynAckTCPHeader.DataOffset = 5;
-        SynAckTCPHeader.ACK = 1;
-        SynAckTCPHeader.SYN = 1;
-        SynAckTCPHeader.WindowSize = 512;
-        
-        
-        ipv4_header SynAckIPv4Header = {};
-        SynAckIPv4Header.Version = 4;
-        SynAckIPv4Header.InternetHeaderLength = 5;
-        SynAckIPv4Header.TotalLength = SynAckIPv4Header.InternetHeaderLength * 4 
-            + SynAckTCPHeader.DataOffset * 4; 
-        SynAckIPv4Header.Identification = Identification++;
-        SynAckIPv4Header.DF = 1;
-        SynAckIPv4Header.TimeToLive = 64;
-        SynAckIPv4Header.Protocol = 6;
-        SynAckIPv4Header.SrcAddress = TCPPacket.Ipv4Header.DestAddress;
-        SynAckIPv4Header.DestAddress = TCPPacket.Ipv4Header.SrcAddress;
-        
-        
-        pseudo_tcp_header SynAckPseudoHeader = {};
-        SynAckPseudoHeader.SrcAddress = SynAckIPv4Header.SrcAddress;
-        SynAckPseudoHeader.DestAddress = SynAckIPv4Header.DestAddress;
-        SynAckPseudoHeader.Protocol = SynAckIPv4Header.Protocol;
-        SynAckPseudoHeader.TCPLength = SynAckTCPHeader.DataOffset * 4;
-        
-        
-        
-        
-        SynAckTCPHeader.Checksum = ComputeTCPChecksum(&SynAckPseudoHeader,&SynAckTCPHeader,NULL,0);
-        SynAckIPv4Header.Checksum = ComputeTCPIPv4Checksum(SynAckIPv4Header);
-        
-        int PacketLength = SynAckIPv4Header.TotalLength;
-        
-        unsigned char *Packet = malloc(PacketLength );
-        Assert(Packet);
-        int Offset = 0;
-        
-        Offset += IPv4HeaderToNetBuffer(SynAckIPv4Header,Packet,512);
-        Offset += TCPHeaderToNetBuffer(SynAckTCPHeader,Packet+Offset,512);
-        
-        
-        
-        struct sockaddr_in DestAddress = {0};
-        DestAddress.sin_family = AF_INET;
-        DestAddress.sin_addr.s_addr = ByteSwapU32(SynAckIPv4Header.DestAddress);
-        
-        printf("ipv4: %hx\ntcp: %hx\n",SynAckIPv4Header.Checksum,SynAckTCPHeader.Checksum);
-        
-        iResult = sendto(RawSockIPv4, (char*)Packet, PacketLength,0, (struct sockaddr *)&DestAddress,sizeof(DestAddress));
-        free(Packet);
-        Packet = 0;
-        PacketLength = 0;
-        
-        if(iResult == -1){
-            perror("sendto");
-            return 1;
-        }
-        
-        memset(Buffer, 0, 512);
-        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
-        if(iResult == -1){
-            perror("recvfrom");
-            return 1;
-        }
-        tcp_packet ACKPacket = ProcessTCPIPPacket(Buffer, 512);
-        int ValidIPv4Ack = VerfiyIPv4Checksum(&ACKPacket.Ipv4Header);
-        int ValidTCPAck = VerfiyTCPChecksum(&ACKPacket.TCPHeader, &ACKPacket.PseudoHeader);
-        Assert(ValidIPv4Ack && ValidTCPAck);
-        Assert(ACKPacket.TCPHeader.ACK == 1);
-        free(ACKPacket.Data);
-        
-        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
-        if(iResult == -1){
-            perror("recvfrom");
-            return 1;
-        }
-        tcp_packet GETPacket = ProcessTCPIPPacket(Buffer, 512);
-        int ValidIPv4Get = VerfiyIPv4Checksum(&GETPacket.Ipv4Header);
-        int ValidTCPGet = VerfiyTCPChecksum(&GETPacket.TCPHeader, &GETPacket.PseudoHeader);
-        Assert(ValidIPv4Get &&ValidTCPGet);
-        Assert(GETPacket.DataSize > 0);
-        printf("Data: %s\n", GETPacket.Data);
-
-
-        char Payload[] = "HTTP/1.1 200 OK\r\n"
-            "Connection: close\r\n"
-            "Content-Length: 18\r\n"
-            "Content-Type: text/plain\r\n"
-            "\r\n"
-            "Hello from Server!";
-        int PayloadSize = sizeof(Payload)-1;
-
-        tcp_packet HTTPResponse = {0};
-        HTTPResponse.Data = Payload;
-        HTTPResponse.DataSize = PayloadSize;
-
-        HTTPResponse.Ipv4Header.Version = 4;
-        HTTPResponse.Ipv4Header.InternetHeaderLength = 5;
-        HTTPResponse.Ipv4Header.Identification = Identification++;
-        HTTPResponse.Ipv4Header.DF = 1;
-        HTTPResponse.Ipv4Header.TimeToLive = 64;
-        HTTPResponse.Ipv4Header.Protocol = 6;
-        HTTPResponse.Ipv4Header.SrcAddress = DEFAULT_ADDRESS;
-        HTTPResponse.Ipv4Header.DestAddress = GETPacket.Ipv4Header.SrcAddress;
-
-        HTTPResponse.TCPHeader.SrcPort = 27015;
-        HTTPResponse.TCPHeader.DestPort = GETPacket.TCPHeader.SrcPort;
-        HTTPResponse.TCPHeader.AckNumber = GETPacket.TCPHeader.SequenceNumber + 1;
-        HTTPResponse.TCPHeader.SequenceNumber = SeqNumber;
-        HTTPResponse.TCPHeader.DataOffset = 5;
-        HTTPResponse.TCPHeader.ACK = 1;
-        HTTPResponse.TCPHeader.WindowSize = 512;
-        SeqNumber += HTTPResponse.DataSize;
-        
-        HTTPResponse.PseudoHeader.SrcAddress = TCPPacket.Ipv4Header.SrcAddress;
-        HTTPResponse.PseudoHeader.DestAddress = TCPPacket.Ipv4Header.DestAddress;
-        HTTPResponse.PseudoHeader.Protocol = 6;
-        HTTPResponse.PseudoHeader.TCPLength = HTTPResponse.TCPHeader.DataOffset * 4 + HTTPResponse.DataSize;
-
-        HTTPResponse.Ipv4Header.TotalLength = HTTPResponse.Ipv4Header.InternetHeaderLength * 4 + HTTPResponse.PseudoHeader.TCPLength;
-
-        HTTPResponse.TCPHeader.Checksum = ComputeTCPChecksum(&HTTPResponse.PseudoHeader, &HTTPResponse.TCPHeader, HTTPResponse.Data, HTTPResponse.DataSize);
-        HTTPResponse.Ipv4Header.Checksum = ComputeTCPIPv4Checksum(HTTPResponse.Ipv4Header);
-        
-        PacketLength = HTTPResponse.Ipv4Header.TotalLength;
-        Packet = malloc(PacketLength);
-        Assert(Packet);
-
-        Offset = 0;
-        Offset += IPv4HeaderToNetBuffer(HTTPResponse.Ipv4Header, Packet, 512);
-        Offset += TCPHeaderToNetBuffer(HTTPResponse.TCPHeader, Packet + Offset, 512);
-        memcpy(Packet + Offset, HTTPResponse.Data, HTTPResponse.DataSize);
-
-        DestAddress.sin_family = AF_INET;
-        DestAddress.sin_addr.s_addr = ByteSwapU32(HTTPResponse.Ipv4Header.DestAddress);
-
-        iResult = sendto(RawSockIPv4, (char *)Packet, PacketLength, 0, (struct sockaddr *)&DestAddress, sizeof(DestAddress));
-        free(Packet);
-        Packet = 0;
-        PacketLength = 0;
-
-
-        memset(Buffer, 0, 512);
-        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
-        if(iResult == -1){
-            perror("recvfrom");
-            return 1;
-        }
-        tcp_packet HTTPACKPacket = ProcessTCPIPPacket(Buffer, 512);
-        int ValidIPv4HTTPACK = VerfiyIPv4Checksum(&HTTPACKPacket.Ipv4Header);
-        int ValidTCPHTTPACK = VerfiyTCPChecksum(&HTTPACKPacket.TCPHeader, &HTTPACKPacket.PseudoHeader);
-        Assert(ValidIPv4HTTPACK && ValidTCPHTTPACK);
-        Assert(HTTPACKPacket.TCPHeader.ACK == 1);
-        free(HTTPACKPacket.Data);
-
-        memset(Buffer, 0, 512);
-        iResult = recv(RawSockIPv4, (char *)Buffer, 512, 0);
-        if(iResult == -1){
-            perror("recvfrom");
-            return 1;
-        }
-        tcp_packet FINPacket = ProcessTCPIPPacket(Buffer, 512);
-        int ValidIPv4Fin = VerfiyIPv4Checksum(&FINPacket.Ipv4Header);
-        int ValidTCPFin = VerfiyTCPChecksum(&FINPacket.TCPHeader, &FINPacket.PseudoHeader);
-        Assert(ValidIPv4Fin && ValidTCPFin);
-        Assert(FINPacket.TCPHeader.FIN == 1);
-        free(FINPacket.Data);
-
-
-
-        tcp_packet ACKClosePacket = {0};
-
-        ACKClosePacket.Ipv4Header.Version = 4;
-        ACKClosePacket.Ipv4Header.InternetHeaderLength = 5;
-        ACKClosePacket.Ipv4Header.Identification = Identification++;
-        ACKClosePacket.Ipv4Header.DF = 1;
-        ACKClosePacket.Ipv4Header.TimeToLive = 64;
-        ACKClosePacket.Ipv4Header.Protocol = 6;
-        ACKClosePacket.Ipv4Header.SrcAddress = DEFAULT_ADDRESS;
-        ACKClosePacket.Ipv4Header.DestAddress = FINPacket.Ipv4Header.SrcAddress;
-
-        ACKClosePacket.TCPHeader.SrcPort = 27015;
-        ACKClosePacket.TCPHeader.DestPort = FINPacket.TCPHeader.SrcPort;
-        ACKClosePacket.TCPHeader.AckNumber = FINPacket.TCPHeader.SequenceNumber + 1;
-        ACKClosePacket.TCPHeader.SequenceNumber = SeqNumber;
-        ACKClosePacket.TCPHeader.DataOffset = 5;
-        ACKClosePacket.TCPHeader.ACK = 1;
-        ACKClosePacket.TCPHeader.WindowSize = 512;
-        SeqNumber += ACKClosePacket.DataSize;
-
-        ACKClosePacket.PseudoHeader.SrcAddress = ACKClosePacket.Ipv4Header.SrcAddress;
-        ACKClosePacket.PseudoHeader.DestAddress = ACKClosePacket.Ipv4Header.DestAddress;
-        ACKClosePacket.PseudoHeader.Protocol = 6;
-        ACKClosePacket.PseudoHeader.TCPLength = ACKClosePacket.TCPHeader.DataOffset * 4 + ACKClosePacket.DataSize;
-
-        ACKClosePacket.Ipv4Header.TotalLength = ACKClosePacket.Ipv4Header.InternetHeaderLength * 4 + ACKClosePacket.PseudoHeader.TCPLength;
-
-        ACKClosePacket.TCPHeader.Checksum = ComputeTCPChecksum(&ACKClosePacket.PseudoHeader, &ACKClosePacket.TCPHeader, ACKClosePacket.Data, ACKClosePacket.DataSize);
-        ACKClosePacket.Ipv4Header.Checksum = ComputeTCPIPv4Checksum(ACKClosePacket.Ipv4Header);
-
-        PacketLength = ACKClosePacket.Ipv4Header.TotalLength;
-        Packet = malloc(PacketLength);
-        Assert(Packet);
-
-        Offset = 0;
-        Offset += IPv4HeaderToNetBuffer(ACKClosePacket.Ipv4Header, Packet, 512);
-        Offset += TCPHeaderToNetBuffer(ACKClosePacket.TCPHeader, Packet + Offset, 512);
-        memcpy(Packet + Offset, ACKClosePacket.Data, ACKClosePacket.DataSize);
-
-        DestAddress.sin_family = AF_INET;
-        DestAddress.sin_addr.s_addr = ByteSwapU32(ACKClosePacket.Ipv4Header.DestAddress);
-
-        iResult = sendto(RawSockIPv4, (char *)Packet, PacketLength, 0, (struct sockaddr *)&DestAddress, sizeof(DestAddress));
-        free(Packet);
-        Packet = 0;
-        PacketLength = 0;
-        
-
-        
-        
-        
-        
-    }
+    
     
     
     
